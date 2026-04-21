@@ -1,0 +1,31 @@
+# checkpoints — too big for GitHub, host elsewhere
+checkpoints/
+*.pt
+*.pth
+
+# generated samples — regenerable
+samples/
+*.mid
+*.midi
+
+# dataset + caches — regenerable or redistributable separately
+JSB-Chorales-dataset/
+data/jsb_chords.pkl
+
+# training artifacts
+logs/
+*.out
+*.err
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+.ipynb_checkpoints/
+
+# editor / OS
+.DS_Store
+.vscode/
+.idea/

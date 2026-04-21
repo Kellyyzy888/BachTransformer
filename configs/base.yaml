@@ -1,0 +1,189 @@
+# All hyperparameters live here. train_m1 / train_m2 read this file.
+# Override any field on the command line, e.g. --override model.n_layers=8
+
+seed: 1470
+
+data:
+  jsb_path: JSB-Chorales-dataset/jsb-chorales-16th.pkl   # from czhuang/JSB-Chorales-dataset
+  piece_length: 64                     # timesteps per training example (16th notes)
+  stride: 32                           # overlap between training chunks
+  batch_size: 64
+  num_workers: 4
+
+tokenizer:
+  pitch_min: 36                        # MIDI C2
+  pitch_max: 84                        # MIDI C6 (inclusive)
+  # vocab = pitches (49) + HOLD + REST + BOS + BAR + PAD = 54
+
+model:
+  d_model: 256
+  n_layers: 6
+  n_heads: 8
+  d_ff: 1024
+  dropout: 0.1
+  max_timesteps: 64
+  n_voices: 4
+
+train:
+  epochs: 100
+  lr: 3.0e-4
+  weight_decay: 0.01
+  warmup_steps: 500
+  grad_clip: 1.0
+  log_every: 50
+  val_every: 500
+  ckpt_dir: checkpoints/m1
+  mixed_precision: true
+
+# Used only by the LEGACY diff-loss baseline (train_m2_diffloss.py).
+rule_loss:
+  enabled: false                       # flipped true in train_m2_diffloss
+  lambda_total: 0.3                    # overall scale; sweep {0.01, 0.1, 0.3, 1.0, 3.0}
+  per_rule_weights:
+    parallel_fifth:   1.0
+    parallel_octave:  1.0
+    voice_crossing:   1.0
+    hidden_fifth:     0.5
+    hidden_octave:    0.5
+    large_leap:       0.3
+    spacing:          0.3
+
+# Used by train_m2.py — PPO fine-tuning of the M1 checkpoint.
+# Design: sparse terminal reward (−HarmonicScore at last generated token) +
+# per-token KL penalty to the frozen M1 reference. Adaptive β tracks target_kl.
+ppo:
+  # Initialization / I/O.
+  init_ckpt: checkpoints/m1/best.pt    # M1 SFT checkpoint to warm-start from
+  ckpt_dir:  checkpoints/m2            # where best.pt / last.pt go
+
+  # Optimizer. Tiny LR — we're nudging a pretrained 4.76M-param LM, not training.
+  # First run @ 1e-5 saturated KL within 13 updates. 5e-6 kept β pinned at its
+  # 1.0 cap for all 200 updates of run 4 (HS 4.50 > M1's 4.20). 2e-6 halves the
+  # per-update drift pressure so the adaptive β controller can regulate within
+  # [1e-3, 1.0] instead of saturating. Tier-1 tuning pass.
+  lr: 2.0e-6
+  # weight_decay, grad_clip, betas come from train.* (shared with SFT setup)
+
+  # Sampling distribution used during rollout. Match M1 baseline eval (0.95)
+  # so update-0 mean HS ≈ M1's 4.7 instead of the 13.7 we got at top_p=1.0.
+  rollout_temperature: 1.0
+  rollout_top_p:       0.95
+
+  # PPO core.
+  # clip_eps tightened from 0.2 -> 0.1. For LM fine-tuning from a strong
+  # SFT init (like M1), 0.2 is too permissive — the policy can shift up
+  # to 20% per minibatch, and over 4 epochs × 4 minibatches that drift
+  # accumulates into noticeable KL growth per rollout.
+  clip_eps: 0.1
+  # value_coef low because the value head is detached from the backbone
+  # (model/transformer.py); its loss only affects the small linear head, so
+  # we don't need the standard 0.5. Keep it nonzero so V(s) keeps tracking.
+  value_coef: 0.1
+  value_clip_eps: 0.1                  # match clip_eps
+  # entropy_coef STAYS AT 0. MusicRL (2024) + recent RLHF reward-hacking
+  # work find that entropy bonuses *worsen* reward hacking in music LMs —
+  # they widen the distribution but don't anchor it to musical structure.
+  # The REST collapse is a reward-specification problem (silence is globally
+  # optimal under -HS), not a sharpness problem. Fix it with (a) a positive
+  # pitch-emission baseline in the reward and (b) tight KL to M1, not entropy.
+  entropy_coef: 0.0
+  gamma: 0.99
+  lam:   0.95
+
+  # KL control. Tightened HARD after REST collapse: target_kl 0.02 -> 0.005
+  # and beta_range cap 0.1 -> 1.0 so β can actually bite when the policy
+  # drifts. Previously β saturated at its 0.1 cap and summed-KL budget per
+  # rollout (~5 total) was enough to walk the policy to the silence attractor.
+  beta_kl:       0.05
+  target_kl:     0.005
+  adaptive_beta: true
+  beta_range:    [1.0e-3, 1.0]
+  # early_stop_kl tracks target_kl so we abort the update the moment mean KL
+  # crosses target, not after it's already doubled.
+  early_stop_kl: 0.005
+
+  # Anti-collapse fixes (added after REST collapse in run 1804127).
+  # pitch_bonus: per-token positive reward for emitting a pitch token (not
+  # REST/HOLD/BOS/BAR/PAD). Originally 0.02, which contributes ~+5 per rollout
+  # (gen_len=252) — same order of magnitude as HS itself (~4-5). That made
+  # "emit pitches" compete with "reduce HS" for the gradient, and the policy
+  # preferentially optimized the easier signal (emission rate). Lowered to
+  # 0.005 for tier-1 tuning: still a nonzero anti-silence floor (+1.25 /
+  # rollout) but HS now dominates the reward gradient by 3-4x.
+  pitch_bonus: 0.005
+  # mask_rest: zero the REST (and BOS/BAR/PAD) logits during rollout sampling,
+  # hard-preventing the policy from emitting silence. HOLD is still allowed
+  # since sustained notes are musically legitimate in Bach chorales.
+  mask_rest: true
+
+  # rule_reward_weights: per-rule weights applied to the PPO reward ONLY.
+  # The eval metric (harmonic_score in rule_checker.py) stays unweighted for
+  # comparability across runs. In run 4 the policy traded parallel 8ves down
+  # (-3) for parallel 5ths up (+15 total), a classic reward-shuffling hack.
+  # Bumping parallel_5ths weight to 2.0 makes that trade explicitly negative-
+  # sum in reward space. Everything else at 1.0 preserves the run-4 baseline
+  # for the remaining rules. Missing keys fall back to the unweighted sum.
+  rule_reward_weights:
+    parallel_5ths:      2.0
+    parallel_8ves:      1.0
+    voice_crossings:    1.0
+    hidden_5ths_outer:  1.0
+    hidden_8ves_outer:  1.0
+    spacing_violations: 1.0
+    large_leaps:        1.0
+    augmented_leaps:    1.0
+
+  # Value-head warmup before PPO. Train V(s) alone for N updates so that
+  # advantages are informative when policy gradient kicks in. Set to 0 to skip.
+  value_warmup_updates: 30
+  value_warmup_lr:      1.0e-4
+
+  # Rollout / update loop.
+  rollout_batch:  32                   # chorales per rollout
+  minibatch_size: 8                    # chorales per PPO minibatch
+  n_epochs:       4                    # PPO epochs per rollout
+  n_updates:      200                  # total PPO updates (each = 1 rollout + n_epochs)
+  log_every:      1
+  ckpt_every:     10
+
+sample:
+  temperature: 1.0
+  top_p: 0.95
+  n_samples: 100
+  piece_length: 64
+  out_dir: samples/m1
+
+# M3-only: constrained decoding.
+decode_m3:
+  alpha: 5.0                           # matches the lib_tfsampling.py default
+
+# M4-only: chord-conditioned tokenizer + transpose augmentation.
+# When `enabled: true`, `jsb_loader.make_dataloaders` produces the
+# interleaved [KEY, RN_t, S_t, A_t, T_t, B_t, ...] sequences and
+# `ChoraleTokenizer` is constructed with the RN vocab loaded from
+# `cache_path` (produced by `python -m data.chord_extractor`).
+chord:
+  enabled: false                       # flip to true for train/train_m4.py
+  cache_path: data/jsb_chords.pkl      # output of data/chord_extractor.py
+  granularity: roman_numeral           # (inversion-stripped; see chord_extractor)
+  transpose_augment: true              # yield all 12 shifts per chorale during train
+
+# M4-only: training.
+train_m4:
+  ckpt_dir: checkpoints/m4
+  # Weight overrides on top of train.* defaults. HOLD stays down-weighted
+  # (same as M1). The KEY prefix tokens appear once per chorale, so we
+  # down-weight them heavily to prevent the first-two-positions loss from
+  # washing out the body loss. RN tokens are full-weight: we want the
+  # model to actually learn the harmony.
+  class_weights:
+    hold:   0.1
+    key:    0.05
+    rn:     1.0
+    pitch:  1.0
+
+# M4-only: decoding / sampling.
+decode_m4:
+  free_generation: true                # if false, --chord_progression is required
+  out_dir: samples/m4
+  n_samples: 100
