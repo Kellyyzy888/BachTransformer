@@ -1,4 +1,4 @@
-# BachGPT — Bach Transformer
+# Bach Transformer
 
 A from-scratch PyTorch decoder-only Transformer (~4.8M params) for four-part
 (SATB) Bach chorale generation, with music-theory rule injection at three
