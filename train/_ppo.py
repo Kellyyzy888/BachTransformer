@@ -85,6 +85,141 @@ def score_tokens_np(tokens_np: np.ndarray, tok: ChoraleTokenizer) -> dict:
     }
 
 
+def _decode_voices_np(tokens_np: np.ndarray, tok: ChoraleTokenizer) -> list[list[int | None]]:
+    """Decode a flat token sequence into four voice lists with `None` for REST.
+
+    This mirrors the representation expected by the rule-checker helpers while
+    staying in-memory during PPO rollouts.
+    """
+    grid = tok.decode(torch.from_numpy(tokens_np.astype(np.int64)))
+    grid = tok.resolve_holds(grid)
+    T = grid.shape[1]
+    voices: list[list[int | None]] = []
+    for v in range(4):
+        row = [None if int(grid[v, t]) < 0 else int(grid[v, t]) for t in range(T)]
+        voices.append(row)
+    return voices
+
+
+def score_token_trajectory_np(
+    tokens_np: np.ndarray,
+    tok: ChoraleTokenizer,
+    rule_reward_weights: dict | None = None,
+) -> dict:
+    """Return both aggregate rule counts and local per-timestep penalties.
+
+    Unlike `score_tokens_np`, this keeps track of *where* each violation first
+    appears. The local penalties are assigned to completed SATB timesteps, which
+    gives PPO a much sharper credit signal than smearing a single terminal
+    HarmonicScore across the whole rollout.
+    """
+    voices = _decode_voices_np(tokens_np, tok)
+    T = len(voices[0]) if voices else 0
+
+    totals = {
+        "parallel_5ths": 0,
+        "parallel_8ves": 0,
+        "voice_crossings": 0,
+        "hidden_5ths_outer": 0,
+        "hidden_8ves_outer": 0,
+        "spacing_violations": 0,
+        "large_leaps": 0,
+        "augmented_leaps": 0,
+    }
+    timestep_penalty = np.zeros(T, dtype=np.float32)
+    weights = rule_reward_weights or {}
+
+    def w(name: str) -> float:
+        return float(weights.get(name, 1.0))
+
+    for t in range(T):
+        s = voices[0][t]
+        a = voices[1][t]
+        tn = voices[2][t]
+        b = voices[3][t]
+
+        if None not in (s, a, tn, b):
+            if s < a:
+                totals["voice_crossings"] += 1
+                timestep_penalty[t] += w("voice_crossings")
+            if a < tn:
+                totals["voice_crossings"] += 1
+                timestep_penalty[t] += w("voice_crossings")
+            if tn < b:
+                totals["voice_crossings"] += 1
+                timestep_penalty[t] += w("voice_crossings")
+
+            if (s - a) > 12:
+                totals["spacing_violations"] += 1
+                timestep_penalty[t] += w("spacing_violations")
+            if (a - tn) > 12:
+                totals["spacing_violations"] += 1
+                timestep_penalty[t] += w("spacing_violations")
+
+        if t == 0:
+            continue
+
+        for v in range(4):
+            prev = voices[v][t - 1]
+            cur = voices[v][t]
+            if prev is None or cur is None:
+                continue
+            iv = abs(cur - prev)
+            if iv > 9:
+                totals["large_leaps"] += 1
+                timestep_penalty[t] += w("large_leaps")
+            if iv == 6:
+                totals["augmented_leaps"] += 1
+                timestep_penalty[t] += w("augmented_leaps")
+
+        for u in range(4):
+            for l in range(u + 1, 4):
+                prev_u = voices[u][t - 1]
+                prev_l = voices[l][t - 1]
+                cur_u = voices[u][t]
+                cur_l = voices[l][t]
+                if None in (prev_u, prev_l, cur_u, cur_l):
+                    continue
+                if prev_u == cur_u or prev_l == cur_l:
+                    continue
+                prev_interval = (prev_u - prev_l) % 12
+                cur_interval = (cur_u - cur_l) % 12
+                up_move = cur_u - prev_u
+                low_move = cur_l - prev_l
+                if up_move * low_move <= 0:
+                    continue
+                if prev_interval == 7 and cur_interval == 7:
+                    totals["parallel_5ths"] += 1
+                    timestep_penalty[t] += w("parallel_5ths")
+                elif prev_interval == 0 and cur_interval == 0:
+                    totals["parallel_8ves"] += 1
+                    timestep_penalty[t] += w("parallel_8ves")
+
+        prev_s = voices[0][t - 1]
+        prev_b = voices[3][t - 1]
+        cur_s = voices[0][t]
+        cur_b = voices[3][t]
+        if None not in (prev_s, prev_b, cur_s, cur_b):
+            ds = cur_s - prev_s
+            db = cur_b - prev_b
+            if ds != 0 and db != 0 and ((ds > 0) == (db > 0)) and abs(ds) > 2:
+                arrival = (cur_s - cur_b) % 12
+                if arrival == 7:
+                    totals["hidden_5ths_outer"] += 1
+                    timestep_penalty[t] += w("hidden_5ths_outer")
+                elif arrival == 0:
+                    totals["hidden_8ves_outer"] += 1
+                    timestep_penalty[t] += w("hidden_8ves_outer")
+
+    harmonic = int(sum(totals.values()))
+    return {
+        "HarmonicScore": harmonic,
+        **totals,
+        "weighted_penalty_by_timestep": timestep_penalty,
+        "weighted_total_penalty": float(timestep_penalty.sum()),
+    }
+
+
 # ---------------------------------------------------------------------------
 # GAE: Generalized Advantage Estimation
 # ---------------------------------------------------------------------------

@@ -133,6 +133,14 @@ ppo:
     large_leaps:        1.0
     augmented_leaps:    1.0
 
+  # Reward shaping mode for PPO.
+  # use_local_rule_reward=true assigns each rule penalty to the timestep where
+  # it first appears, then spreads that timestep penalty across its 4 voice
+  # tokens. This gives much sharper credit assignment than smearing one
+  # sequence-level HS across the whole rollout.
+  use_local_rule_reward: true
+  local_rule_reward_scale: 1.0
+
   # Value-head warmup before PPO. Train V(s) alone for N updates so that
   # advantages are informative when policy gradient kicks in. Set to 0 to skip.
   value_warmup_updates: 30

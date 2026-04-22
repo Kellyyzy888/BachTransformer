@@ -40,7 +40,7 @@ from data.tokenizer import ChoraleTokenizer, TokenizerConfig
 from model.transformer import build_model_from_config
 from sample._midi_utils import make_prompt
 from train._common import load_config, parse_args, save_checkpoint, set_seed
-from train._ppo import compute_gae, ppo_losses, score_tokens_np
+from train._ppo import compute_gae, ppo_losses, score_token_trajectory_np
 
 
 # ---------------------------------------------------------------------------
@@ -148,37 +148,31 @@ def rollout(
     mask[:, prompt_len:] = 1.0
 
     # Score each rollout via the in-memory rule checker.
-    # Two HS signals are computed:
-    #   - harmonic_scores (hs_t):   unweighted sum over all 8 rules. Stays
-    #                               comparable to the eval metric and to all
-    #                               prior runs. Used in telemetry + best-HS
-    #                               checkpointing.
-    #   - harmonic_scores_reward:   applies cfg.ppo.rule_reward_weights (if
-    #                               present) to punish specific rule types
-    #                               more than others. Used ONLY to shape the
-    #                               PPO reward. Run 4 reshuffled P8→P5
-    #                               (reward-hacking); bumping P5 weight >1
-    #                               makes that trade negative-sum.
+    # Two signals are tracked:
+    #   - harmonic_scores: unweighted HS, kept comparable to eval.
+    #   - local_step_rewards: rule penalties assigned to the timestep where the
+    #     violation first appears. This sharpens PPO credit assignment versus
+    #     smearing one terminal reward across the whole sequence.
     harmonic_scores = np.zeros(B, dtype=np.float32)
-    harmonic_scores_reward = np.zeros(B, dtype=np.float32)
+    local_step_rewards = np.zeros((B, piece_length), dtype=np.float32)
     rule_reward_weights = cfg["ppo"].get("rule_reward_weights", None)
+    local_reward_scale = float(cfg["ppo"].get("local_rule_reward_scale", 1.0))
+    use_local_rule_reward = bool(cfg["ppo"].get("use_local_rule_reward", True))
     totals = {"parallel_5ths": 0, "parallel_8ves": 0, "voice_crossings": 0,
               "hidden_5ths_outer": 0, "hidden_8ves_outer": 0,
               "spacing_violations": 0, "large_leaps": 0, "augmented_leaps": 0}
     for b in range(B):
-        stats = score_tokens_np(tokens[b].cpu().numpy(), tok)
+        stats = score_token_trajectory_np(
+            tokens[b].cpu().numpy(),
+            tok,
+            rule_reward_weights=rule_reward_weights,
+        )
         harmonic_scores[b] = stats["HarmonicScore"]
-        if rule_reward_weights is None:
-            harmonic_scores_reward[b] = stats["HarmonicScore"]
-        else:
-            harmonic_scores_reward[b] = sum(
-                float(rule_reward_weights.get(k, 1.0)) * float(stats[k])
-                for k in totals
-            )
+        local_step_rewards[b] = -local_reward_scale * stats["weighted_penalty_by_timestep"]
         for k in totals:
             totals[k] += stats[k]
     hs_t = torch.tensor(harmonic_scores, device=device)               # (B,)
-    hs_reward_t = torch.tensor(harmonic_scores_reward, device=device) # (B,)
+    local_step_rewards_t = torch.tensor(local_step_rewards, device=device)  # (B, piece_length)
 
     # Reward assembly.
     #   KL term: per generated token, -β * (log π - log π_ref). Sample-based
@@ -186,20 +180,24 @@ def rollout(
     kl_per_token = old_log_probs - ref_log_probs                     # (B, T_full)
     rewards = -beta_kl * kl_per_token * mask                         # zero at prompt
 
-    # HS reward is distributed densely across generated tokens rather than
-    # applied only at the terminal position. The original sparse-terminal
-    # formulation made early tokens invisible to the rule signal: GAE
-    # credit factor (γλ)^k = 0.9405^252 ≈ 2e-7 at the prompt boundary, so
-    # the first ~230 of 252 generated tokens received essentially zero
-    # gradient from HS and random-walked away from the ref. Dense
-    # distribution gives every generated token -HS/gen_len per step, which
-    # means the sum over the sequence still equals -HS and the gradient
-    # magnitude at every token is comparable to the per-token KL penalty.
-    # (Standard RLHF-PPO practice; cf. InstructGPT Section 3.5.)
-    # Uses the WEIGHTED HS (hs_reward_t) so per-rule weights actually shape
-    # the gradient. hs_t (unweighted) is kept for telemetry only.
-    hs_dense = (-hs_reward_t).unsqueeze(1) / float(gen_len)          # (B, 1)
-    rewards = rewards + hs_dense * mask                              # zero at prompt
+    if use_local_rule_reward:
+        # Map timestep penalties onto the four generated tokens of that step.
+        # Timestep 0 is the prompt chord, so only timesteps 1..piece_length-1
+        # participate in PPO reward shaping.
+        local_token_rewards = torch.zeros(B, T_full, device=device)
+        for t in range(1, piece_length):
+            start = 4 * t
+            end = start + 4
+            local_token_rewards[:, start:end] = (
+                local_step_rewards_t[:, t].unsqueeze(1) / 4.0
+            )
+        rewards = rewards + local_token_rewards * mask
+    else:
+        # Compatibility fallback: smear the weighted episode penalty across all
+        # generated tokens, matching the previous dense-HS behavior.
+        weighted_total = local_step_rewards_t[:, 1:].sum(dim=1).abs()
+        hs_dense = (-weighted_total).unsqueeze(1) / float(gen_len)
+        rewards = rewards + hs_dense * mask
 
     # Pitch-emission bonus — destroys the silence attractor. Under -HS alone,
     # "emit REST everywhere" is a global reward minimum (no notes = no rule
@@ -242,6 +240,7 @@ def rollout(
         "rewards":       rewards,
         "mask":          mask,
         "harmonic_scores": hs_t,
+        "local_step_rewards": local_step_rewards_t,
         "kl_per_token":    kl_per_token,
         "rule_totals":     totals,
         "token_frac":      {"pitch": pitch_frac, "hold": hold_frac, "rest": rest_frac},
