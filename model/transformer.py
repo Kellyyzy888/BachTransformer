@@ -56,19 +56,41 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(cfg.dropout)
         self.resid_dropout = nn.Dropout(cfg.dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_bias: torch.Tensor | None = None) -> torch.Tensor:
         B, L, D = x.shape
         qkv = self.qkv(x).reshape(B, L, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)                              # (B, L, H, hd)
         q = q.transpose(1, 2)                                    # (B, H, L, hd)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        # F.scaled_dot_product_attention handles the causal mask + flash-attn
-        # paths efficiently if available (PyTorch 2.x).
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=self.attn_dropout.p if self.training else 0.0,
-            is_causal=True,
-        )
+
+        if attn_bias is not None:
+            # Manual attention path: we need to inject the additive bias
+            # into the pre-softmax scores, which F.scaled_dot_product_attention
+            # doesn't support with an additive bias + causal mask combined.
+            scale = 1.0 / math.sqrt(self.head_dim)
+            scores = torch.matmul(q, k.transpose(-2, -1)) * scale   # (B, H, L, L)
+            # Causal mask: prevent attending to future positions
+            causal_mask = torch.triu(
+                torch.ones(L, L, device=x.device, dtype=torch.bool), diagonal=1
+            )
+            scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            # Add the chord attention bias (only nonzero where pitch->RN
+            # at same timestep)
+            scores = scores + attn_bias
+            attn = F.softmax(scores, dim=-1)
+            if self.training:
+                attn = self.attn_dropout(attn)
+            out = torch.matmul(attn, v)
+        else:
+            # Fast path: F.scaled_dot_product_attention handles the causal
+            # mask + flash-attn paths efficiently (PyTorch 2.x).
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                is_causal=True,
+            )
+
         out = out.transpose(1, 2).reshape(B, L, D)
         return self.resid_dropout(self.proj(out))
 
@@ -92,8 +114,8 @@ class Block(nn.Module):
         self.norm2 = nn.LayerNorm(cfg.d_model)
         self.ff = FeedForward(cfg)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
+    def forward(self, x: torch.Tensor, attn_bias: torch.Tensor | None = None) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), attn_bias=attn_bias)
         x = x + self.ff(self.norm2(x))
         return x
 
@@ -111,6 +133,8 @@ class ChoraleTransformer(nn.Module):
             cfg.max_timesteps,
             cfg.n_voices,
             chord_layout=cfg.chord_layout,
+            chord_attn_bias=cfg.chord_layout,   # enable bias for M4
+            n_heads=cfg.n_heads,
         )
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
@@ -153,8 +177,17 @@ class ChoraleTransformer(nn.Module):
         x = self.token_emb(input_ids) * math.sqrt(self.cfg.d_model)
         x = self.pos(x)
         x = self.drop(x)
+
+        # Compute chord attention bias once and reuse across all layers.
+        # Returns None for M1 (no chord layout), so the fast SDPA path
+        # is used. For M4, the bias is (1, H, L, L) and nudges pitch
+        # tokens to attend more strongly to their timestep's RN token.
+        attn_bias = self.pos.get_chord_attn_bias_mask(
+            input_ids.size(1), input_ids.device
+        )
+
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x, attn_bias=attn_bias)
         x = self.norm_out(x)
         logits = self.lm_head(x)
         if return_values:

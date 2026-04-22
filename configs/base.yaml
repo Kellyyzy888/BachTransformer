@@ -25,7 +25,8 @@ model:
   n_voices: 4
 
 train:
-  epochs: 100
+  epochs: 150                          # bumped from 100: 12x transpose augmentation
+                                       # means fewer passes per original chorale
   lr: 3.0e-4
   weight_decay: 0.01
   warmup_steps: 500
@@ -182,12 +183,14 @@ train_m4:
   # Weight overrides on top of train.* defaults. HOLD stays down-weighted
   # (same as M1). The KEY prefix tokens appear once per chorale, so we
   # down-weight them heavily to prevent the first-two-positions loss from
-  # washing out the body loss. RN tokens are full-weight: we want the
-  # model to actually learn the harmony.
+  # washing out the body loss. RN tokens down-weighted from 1.0 to 0.3:
+  # RN prediction is a much easier task (89 symbols, highly predictable
+  # from context) and at weight 1.0 the model reduces loss cheaply via
+  # RN accuracy at the expense of pitch modeling quality.
   class_weights:
     hold:   0.1
     key:    0.05
-    rn:     1.0
+    rn:     0.3                        # was 1.0
     pitch:  1.0
 
 # M4-only: decoding / sampling.
