@@ -32,17 +32,22 @@ class ConstrainedProcessor:
     silently skipped (any of {prev_upper, prev_self, cur_upper} being HOLD
     short-circuited the rule), which made alpha tuning ineffective.
 
-    Three rules implemented here (the rest are training-only via M2):
+    Rules implemented here:
       1. voice crossing
-      2. large leaps (> max_leap semitones)
-      3. parallel 5ths / 8ves
+      2. spacing (> octave between S-A or A-T)
+      3. large leaps (> max_leap semitones)
+      4. parallel 5ths / 8ves
+      5. hidden 5ths / 8ves in the outer voices
     """
 
     def __init__(self, tok: ChoraleTokenizer, alpha: float = 5.0,
-                 max_leap: int = 12):
+                 max_leap: int = 12, spacing_limit: int = 12,
+                 hidden_leap_threshold: int = 2):
         self.tok = tok
         self.alpha = alpha
         self.max_leap = max_leap
+        self.spacing_limit = spacing_limit
+        self.hidden_leap_threshold = hidden_leap_threshold
         self.P = tok.cfg.n_pitches
         self.pmin = tok.cfg.pitch_min
 
@@ -103,7 +108,15 @@ class ConstrainedProcessor:
                 upper = cur[voice - 1]
                 penalty[b, : self.P] = penalty[b, : self.P] + (cand > upper).float()
 
-            # 3. parallel 5ths / 8ves with already-emitted voices this tstep
+            # 3. spacing: adjacent upper voices must stay within an octave.
+            #    Only applies when emitting A (vs current S) or T (vs current A).
+            if voice in (1, 2) and cur[voice - 1] is not None:
+                upper = cur[voice - 1]
+                penalty[b, : self.P] = penalty[b, : self.P] + (
+                    (upper - cand) > self.spacing_limit
+                ).float()
+
+            # 4. parallel 5ths / 8ves with already-emitted voices this tstep
             for u in range(voice):
                 if prev[u] is None or prev_v is None or cur[u] is None:
                     continue
@@ -118,6 +131,23 @@ class ConstrainedProcessor:
                     low_move = p_idx - prev_v
                     if (up_move > 0 and low_move > 0) or (up_move < 0 and low_move < 0):
                         penalty[b, p_idx] += 1.0
+
+            # 5. hidden 5ths / 8ves on the outer voices (S-B). This can only
+            #    be evaluated when we emit the bass, since soprano is sampled
+            #    first in the current timestep and the arrival interval depends
+            #    on both outer voices being known.
+            if voice == 3 and prev[0] is not None and prev_v is not None and cur[0] is not None:
+                cur_s = cur[0]
+                prev_s = prev[0]
+                ds = cur_s - prev_s
+                if abs(ds) > self.hidden_leap_threshold and ds != 0:
+                    for p_idx in range(self.P):
+                        db = p_idx - prev_v
+                        if db == 0 or ((ds > 0) != (db > 0)):
+                            continue
+                        arrival = (cur_s - p_idx) % 12
+                        if arrival in (0, 7):
+                            penalty[b, p_idx] += 1.0
 
         return logits - self.alpha * penalty
 

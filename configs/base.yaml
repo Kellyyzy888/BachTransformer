@@ -36,7 +36,9 @@ train:
   ckpt_dir: checkpoints/m1
   mixed_precision: true
 
-# Used only by the LEGACY diff-loss baseline (train_m2_diffloss.py).
+# Differentiable soft-rule regularizer.
+# Can be enabled for the legacy diff-loss baseline (train_m2_diffloss.py)
+# or for M4 training (train_m4.py) to build an "M4 + soft rule loss" model.
 rule_loss:
   enabled: false                       # flipped true in train_m2_diffloss
   lambda_total: 0.3                    # overall scale; sweep {0.01, 0.1, 0.3, 1.0, 3.0}

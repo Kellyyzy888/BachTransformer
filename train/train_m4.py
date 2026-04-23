@@ -45,6 +45,7 @@ from data.tokenizer import ChoraleTokenizer, TokenizerConfig
 from model.transformer import build_model_from_config
 from train._common import (load_config, parse_args, save_checkpoint, set_seed,
                            warmup_cosine)
+from train.rule_loss import build_rule_loss_from_config
 
 
 def _build_class_weights(
@@ -84,6 +85,23 @@ def _build_class_weights(
     for i in range(tok.cfg.n_pitches):
         w[i] = pitch_w
     return w
+
+
+def _extract_voice_only_view(
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert M4's chord-interleaved sequence into a voice-only SATB view."""
+    full_seq = torch.cat([input_ids[:, :1], target_ids], dim=1)
+    full_len = full_seq.size(1)
+    positions = torch.arange(full_len, device=full_seq.device)
+    voice_mask = (positions >= 3) & (((positions - 2) % 5) != 0)
+    voice_pos = positions[voice_mask]
+    logit_pos = voice_pos - 1
+    voice_logits = logits.index_select(1, logit_pos)
+    voice_ids = full_seq.index_select(1, voice_pos)
+    return voice_logits, voice_ids
 
 
 def main() -> None:
@@ -144,6 +162,15 @@ def main() -> None:
         )
     )
 
+    use_rule_loss = bool(cfg.get("rule_loss", {}).get("enabled", False))
+    rule_loss = None
+    if use_rule_loss:
+        rule_loss = build_rule_loss_from_config(cfg, tok).to(device)
+        print(
+            f"soft rule loss enabled: lambda={cfg['rule_loss']['lambda_total']} "
+            f"weights={cfg['rule_loss']['per_rule_weights']}"
+        )
+
     optim = torch.optim.AdamW(
         model.parameters(),
         lr=cfg["train"]["lr"],
@@ -177,12 +204,19 @@ def main() -> None:
             optim.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=cfg["train"]["mixed_precision"]):
                 logits = model(ids)                                    # (B, L, V)
-                loss = F.cross_entropy(
+                ce = F.cross_entropy(
                     logits.reshape(-1, logits.size(-1)),
                     tgt.reshape(-1),
                     weight=class_weights,
                     ignore_index=tok.PAD,
                 )
+                if use_rule_loss:
+                    voice_logits, voice_ids = _extract_voice_only_view(logits, ids, tgt)
+                    rl = rule_loss(voice_logits, voice_ids)
+                    loss = ce + rl["total"]
+                else:
+                    rl = None
+                    loss = ce
 
             scaler.scale(loss).backward()
             scaler.unscale_(optim)
@@ -192,15 +226,26 @@ def main() -> None:
 
             step += 1
             if step % log_every == 0:
-                pbar.set_postfix(loss=f"{loss.item():.3f}", lr=f"{lr_now:.2e}")
+                if rl is None:
+                    pbar.set_postfix(loss=f"{loss.item():.3f}", lr=f"{lr_now:.2e}")
+                else:
+                    pbar.set_postfix(
+                        ce=f"{ce.item():.3f}",
+                        rule=f"{rl['total'].item():.3f}",
+                        loss=f"{loss.item():.3f}",
+                        lr=f"{lr_now:.2e}",
+                    )
             if step % val_every == 0:
-                val_w, val_pitch, val_rn = _validate(
-                    model, val_loader, device, tok, class_weights
+                val_w, val_pitch, val_rn, val_rule = _validate(
+                    model, val_loader, device, tok, class_weights, rule_loss
                 )
-                print(
+                msg = (
                     f"[step {step}] val_weighted={val_w:.4f} "
                     f"pitch_only={val_pitch:.4f}  rn_only={val_rn:.4f}"
                 )
+                if val_rule is not None:
+                    msg += f"  rule_only={val_rule:.4f}"
+                print(msg)
                 # Track best checkpoint by pitch-only CE so we're comparing
                 # apples to apples with M1's metric. rn_only is reported
                 # for diagnostic purposes — if it's suspiciously low,
@@ -214,8 +259,8 @@ def main() -> None:
 
 
 @torch.no_grad()
-def _validate(model, loader, device, tok, class_weights) -> tuple[float, float, float]:
-    """Returns (weighted_val_loss, pitch_only_val_loss, rn_only_val_loss).
+def _validate(model, loader, device, tok, class_weights, rule_loss=None) -> tuple[float, float, float, float | None]:
+    """Returns (weighted_val_loss, pitch_only_val_loss, rn_only_val_loss, rule_only).
 
     The weighted CE matches training. The two unweighted slices:
       - pitch_only: only where target is a real pitch token (0..n_pitches-1)
@@ -228,6 +273,7 @@ def _validate(model, loader, device, tok, class_weights) -> tuple[float, float, 
     tot_w, cnt_w = 0.0, 0
     tot_p, cnt_p = 0.0, 0
     tot_r, cnt_r = 0.0, 0
+    tot_rule, cnt_rule = 0.0, 0
     for batch in loader:
         ids = batch["input_ids"].to(device)
         tgt = batch["target_ids"].to(device)
@@ -269,10 +315,17 @@ def _validate(model, loader, device, tok, class_weights) -> tuple[float, float, 
             tot_r += lr.item()
             cnt_r += int(rn_mask.sum().item())
 
+        if rule_loss is not None:
+            voice_logits, voice_ids = _extract_voice_only_view(logits, ids, tgt)
+            rl = rule_loss(voice_logits, voice_ids)
+            tot_rule += float(rl["total"].item())
+            cnt_rule += 1
+
     return (
         tot_w / max(1, cnt_w),
         tot_p / max(1, cnt_p),
         tot_r / max(1, cnt_r),
+        (tot_rule / max(1, cnt_rule)) if rule_loss is not None else None,
     )
 
 
