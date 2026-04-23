@@ -86,6 +86,74 @@ def tokens_to_midi(
     pm.write(str(out_path))
 
 
+def tokens_to_midi_listen(
+    tokens: torch.Tensor,
+    tokenizer: ChoraleTokenizer,
+    out_path: str | Path,
+    seconds_per_step: float = 0.15,
+) -> None:
+    """Listening-friendly MIDI renderer.
+
+    Differs from `tokens_to_midi` in ONE way: consecutive (pitch, HOLD,
+    HOLD, ...) runs in the same voice are merged into a single sustained
+    `pretty_midi.Note` whose duration equals run_length * seconds_per_step.
+    This is what you want for A/B listening stimuli — you hear quarter
+    notes as quarters, halves as halves, and phrase ends as long tones.
+
+    DO NOT use this for `rule_checker.load_satb()` — the rule checker
+    recovers the pitch sequence by reading one note per 16th-note tick
+    and depends on `tokens_to_midi`'s one-note-per-step output. Only use
+    this renderer for the audio demo + A/B study.
+
+    `seconds_per_step` defaults to 0.15 s — at 16 ticks per bar that is
+    ~2.4 s/bar ≈ 100 BPM quarter, a typical chorale tempo. The rule-
+    checker renderer uses 0.25 s (60 BPM) because timing doesn't matter
+    there.
+    """
+    # Inline the layout-agnostic prep: strip chord tokens if present, then
+    # convert the voice-only stream to a (4, T) pitch grid *without*
+    # resolve_holds — we want to keep the HOLD sentinels so we can merge
+    # runs below.
+    pitch_tokens = _strip_chord_tokens(tokens, tokenizer)
+    grid = tokenizer.decode(pitch_tokens)                  # (4, T), has HOLD_RAW
+    T = grid.shape[1]
+
+    pm = pretty_midi.PrettyMIDI()
+    for v in range(4):
+        instr = pretty_midi.Instrument(program=VOICE_PROGRAMS[v], name=VOICE_NAMES[v])
+        t = 0
+        while t < T:
+            p = int(grid[v, t])
+            if p == tokenizer.REST_RAW:
+                t += 1
+                continue
+            if p == tokenizer.HOLD_RAW:
+                # Dangling HOLD at the start of a voice (no pitch yet) —
+                # just skip. resolve_holds would have made it a REST too.
+                t += 1
+                continue
+            # p is a real pitch. Walk forward through HOLDs AND
+            # same-pitch repeats — treat a repeated pitch as a sustained
+            # note. The tokenizer's training-time encoding collapses
+            # "sustain" and "re-articulate same pitch" into the same
+            # representation (pitch + HOLDs), so at render time we
+            # cannot distinguish them and should render the less-ugly
+            # version (one sustained note, not a chopped re-attack).
+            start = t
+            end = t + 1
+            while end < T and int(grid[v, end]) in (tokenizer.HOLD_RAW, int(p)):
+                end += 1
+            instr.notes.append(pretty_midi.Note(
+                velocity=80, pitch=int(p),
+                start=start * seconds_per_step,
+                end=end * seconds_per_step,
+            ))
+            t = end
+        pm.instruments.append(instr)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    pm.write(str(out_path))
+
+
 # Common Bach-chorale opening chords (SATB, MIDI pitches). All are in keys
 # Bach actually uses, in the voice ranges the model was trained on. We prime
 # with a real first chord instead of BOS because BOS never appears in training

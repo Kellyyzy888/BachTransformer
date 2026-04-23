@@ -48,7 +48,7 @@ from tqdm import tqdm
 from data.tokenizer import ChoraleTokenizer, TokenizerConfig, _tonic_to_pc
 from model.transformer import build_model_from_config
 from train._common import load_config
-from sample._midi_utils import tokens_to_midi
+from sample._midi_utils import tokens_to_midi, tokens_to_midi_listen
 
 
 # ---------------------------------------------------------------------------
@@ -237,11 +237,19 @@ def _nucleus_filter(probs: torch.Tensor, top_p: float) -> torch.Tensor:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _load_constrained_processor(tok: ChoraleTokenizer, cfg: dict):
+def _load_constrained_processor(tok: ChoraleTokenizer, cfg: dict,
+                                metric: bool = False,
+                                hold_prior: bool = False,
+                                hold_prior_scale: float = 1.0,
+                                couple: bool = False):
     """Lazy-import ConstrainedProcessor from decode_m3 and wrap it so it
     only acts on voice slots (it wasn't written with chord interleaving
     in mind; RN slots would be penalized as voice-crossing nonsense
     otherwise).
+
+    If metric=True, use MetricConstrainedProcessor (M3-metric): the
+    parallel-motion penalty is scaled by the landing timestep's metric
+    weight (downbeat = 1.5x, off-beat = 0.25x, default DEFAULT_METRIC_WEIGHTS).
     """
     try:
         from sample.decode_m3 import ConstrainedProcessor
@@ -250,7 +258,23 @@ def _load_constrained_processor(tok: ChoraleTokenizer, cfg: dict):
             "decode_m3.ConstrainedProcessor not found — needed for --constrained"
         ) from e
 
-    inner = ConstrainedProcessor(tok, alpha=cfg.get("decode_m3", {}).get("alpha", 5.0))
+    alpha = cfg.get("decode_m3", {}).get("alpha", 5.0)
+    if metric:
+        from sample.metric_mask import (
+            MetricConstrainedProcessor,
+            DEFAULT_HOLD_BIAS,
+            DEFAULT_MAX_MOVES,
+        )
+        inner = MetricConstrainedProcessor(
+            tok, alpha=alpha,
+            hold_bias=DEFAULT_HOLD_BIAS if hold_prior else None,
+            hold_bias_scale=hold_prior_scale,
+            max_moves=DEFAULT_MAX_MOVES if couple else None,
+        )
+    else:
+        if hold_prior or couple:
+            raise ValueError("--hold_prior / --couple require --metric")
+        inner = ConstrainedProcessor(tok, alpha=alpha)
 
     def processor(logits: torch.Tensor, generated: torch.Tensor) -> torch.Tensor:
         # `generated` in the chord layout is the full sequence so far.
@@ -284,6 +308,26 @@ def main() -> None:
     ap.add_argument("--out_dir", default=None)
     ap.add_argument("--constrained", action="store_true",
                     help="combine with M3 ConstrainedProcessor on voice slots")
+    ap.add_argument("--metric", action="store_true",
+                    help="with --constrained: scale the parallel-motion "
+                         "penalty by metric position (M3-metric ablation)")
+    ap.add_argument("--hold_prior", action="store_true",
+                    help="with --constrained --metric: add beat-aware HOLD "
+                         "bias to logits so sustained notes actually sustain")
+    ap.add_argument("--hold_prior_scale", type=float, default=1.0,
+                    help="multiplier on DEFAULT_HOLD_BIAS; increase if notes "
+                         "are still chopped, decrease if they drone")
+    ap.add_argument("--couple", action="store_true",
+                    help="with --metric: enforce 'at most N voices move per "
+                         "off-beat' (species-counterpoint coupling)")
+    ap.add_argument("--listen", action="store_true",
+                    help="render MIDI with sustained notes (merges HOLD runs). "
+                         "Use for audio demos / A/B study stimuli — NOT for "
+                         "rule_checker eval.")
+    ap.add_argument("--seconds_per_step", type=float, default=None,
+                    help="16th-note duration in seconds. Default 0.25 for "
+                         "rule-checker render, 0.15 for --listen. Typical "
+                         "chorale tempo: 0.20 (75 BPM) or 0.22 (~68 BPM).")
     ap.add_argument("--chord_progression", default=None,
                     help="path to a file containing one RN per line (or "
                          "space-separated on one line)")
@@ -336,7 +380,21 @@ def main() -> None:
         text = Path(args.chord_progression).read_text()
         forced_rns = _parse_progression(text, piece_length)
 
-    logit_proc = _load_constrained_processor(tok, cfg) if args.constrained else None
+    logit_proc = (
+        _load_constrained_processor(tok, cfg, metric=args.metric,
+                                    hold_prior=args.hold_prior,
+                                    hold_prior_scale=args.hold_prior_scale,
+                                    couple=args.couple)
+        if args.constrained else None
+    )
+    if args.metric and not args.constrained:
+        print("WARNING: --metric has no effect without --constrained; ignoring.")
+    if args.listen:
+        sps = args.seconds_per_step if args.seconds_per_step is not None else 0.15
+        render = lambda seq, tk, path: tokens_to_midi_listen(seq, tk, path, seconds_per_step=sps)
+    else:
+        sps = args.seconds_per_step if args.seconds_per_step is not None else 0.25
+        render = lambda seq, tk, path: tokens_to_midi(seq, tk, path, seconds_per_step=sps)
 
     file_list = out_dir / "file_list.txt"
     with open(file_list, "w") as flist:
@@ -354,12 +412,14 @@ def main() -> None:
                 seed=i,
             )
             fname = f"sample_{i:04d}.mid"
-            tokens_to_midi(seq, tok, out_dir / fname)
+            render(seq, tok, out_dir / fname)
             flist.write(f"{i}\t{fname}\n")
 
     mode_str = "chord-conditioned" if forced_rns else "free"
     if args.constrained:
-        mode_str += " + constrained"
+        mode_str += " + metric-weighted" if args.metric else " + constrained"
+    if args.listen:
+        mode_str += " (listen render)"
     print(f"wrote {n} {mode_str} samples to {out_dir}")
 
 

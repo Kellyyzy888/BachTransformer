@@ -17,6 +17,13 @@ Chord conditioning alone (M4) does not help; rule-masked decoding alone (M3)
 helps; the combination is where the win comes from. See the writeup for the
 ablation story.
 
+We then extended the same decode-time-constraint philosophy from harmony to
+**rhythm and texture** (M5): a metric-weighted rule mask, a beat-aware HOLD
+prior, cross-voice articulation coupling, and REST suppression together cut
+the per-voice attack density from 16 per bar down to about 3 — Bach territory
+— without touching the model or the HS score. See the "Meter-aware decoding"
+section below for how to run it.
+
 ## Experimental arms
 
 | ID | What changes | Where the rules live | Result vs M1 |
@@ -25,7 +32,8 @@ ablation story.
 | M2 | PPO fine-tune with `−HarmonicScore` reward | training (RL) | +10% (worse) |
 | M3 | M1 + logit masking at decode | sampling | 1.35 HS (much better, earlier eval) |
 | **M4** | Chord-conditioned SFT (TonicNet-style, interleaved Roman numerals, all-12-key transpose) | training (data) | +8% (worse) |
-| **M4 + M3** | M4 model with M3 rule-mask at decode | both | **−47% (best)** |
+| **M4 + M3** | M4 model with M3 rule-mask at decode | both | **−47% (best HS)** |
+| M4 + M5 | M4 model with meter-aware decode stack (metric mask + HOLD prior + voice coupling + REST penalty) | sampling (rhythm + texture) | −43% HS, attacks/bar 16 → 3 (Bach-like texture) |
 
 ## Layout
 
@@ -48,13 +56,21 @@ bach_transformer/
   sample/
     decode_m1.py         # vanilla autoregressive sampling
     decode_m2.py         # M2 sampling (matches PPO rollout distribution)
-    decode_m3.py         # constrained decoding (logit masking)
+    decode_m3.py         # constrained decoding (logit masking, uniform)
     decode_m4.py         # M4 sampling (free + chord-progression-forced)
-                         #   pass --constrained to stack M3 rule mask
-    _midi_utils.py       # shared token→MIDI conversion
+                         #   --constrained stacks M3 rule mask
+                         #   --metric     metric-weighted parallel penalty
+                         #   --hold_prior beat-aware HOLD logit bias
+                         #   --couple     cross-voice articulation coupling
+                         #   --listen     sustained-note renderer (A/B audio)
+    metric_mask.py       # M5: metric weights, HOLD prior, voice coupling,
+                         #     REST suppression — all decode-time
+    _midi_utils.py       # shared token→MIDI conversion (rule + listen renders)
   eval/
     run_eval.py          # sweep generated MIDI through rule_checker.py
+    count_holds.py       # per-voice attack density and HOLD fraction diagnostics
     ab_study.py          # human A/B listening study (prepare + analyze)
+    METRIC_ABLATION.md   # run book for the M5 ablation rows
   literature/
     related_work.md      # SOTA positioning, BibTeX
   configs/base.yaml      # all hyperparameters
@@ -113,6 +129,41 @@ silently runs M1 and overwrites `checkpoints/m1/best.pt`.
 **Gotcha:** never run anything that imports torch on a login node — Brown's
 OSCAR auto-penalizes login-node compute. Use `interact` or `sbatch`.
 
+## Meter-aware decoding (M5)
+
+The M5 stack adds four decode-time constraints to M4+M3, all composable via
+CLI flags. The same checkpoint (`checkpoints/m4/best.pt`) is used for every
+arm; only the sampler changes.
+
+```bash
+# Full M5 stack: harmonic rule mask + metric weighting + HOLD prior +
+# voice coupling, rendered with sustained notes at ~75 BPM
+python -m sample.decode_m4 --ckpt checkpoints/m4/best.pt \
+    --constrained --metric --hold_prior --couple \
+    --listen --seconds_per_step 0.20 \
+    --n 50 --out_dir samples/m4_m5
+
+# Check the rhythmic fingerprint
+python -m eval.count_holds samples/m4_m5
+# Expected: attacks/bar/voice ~ 3, mean note length ~ 5 × 16th,
+# implied HOLD fraction ~ 80%
+```
+
+Each flag is independently ablatable:
+
+| Flag | What it adds |
+|------|--------------|
+| `--constrained` | M3 uniform rule mask (parallel 5ths/8ves, crossings, leaps) |
+| `--metric` | Scale the parallel-motion penalty by beat position (1.5× on downbeat, 0.25× on 16th off-beats) |
+| `--hold_prior` | Bias HOLD's logit by beat position (−2 on downbeat, +7 on 16th off-beats) |
+| `--hold_prior_scale FLOAT` | Multiply every HOLD bias (default 1.0; try 2.0 if still chopped, 0.5 if droning) |
+| `--couple` | Enforce "at most one voice moves per off-beat" (species-counterpoint rule) |
+| `--listen` | Merge HOLD runs + same-pitch runs into sustained notes for audio (do NOT combine with rule-checker eval) |
+| `--seconds_per_step FLOAT` | Per-16th duration; 0.25 = 60 BPM (default for rule eval), 0.20 = 75 BPM, 0.15 = 100 BPM |
+
+Run book with all commands and the target numbers:
+[`eval/METRIC_ABLATION.md`](eval/METRIC_ABLATION.md).
+
 ## Chord-progression-forced generation (M4 only)
 
 Because M4 conditions on Roman numerals, we can pre-specify a progression
@@ -159,5 +210,7 @@ chord-conditioning layout.
 - **Krumhansl-Kessler** key-detection algorithm (implemented inside music21)
 
 The Transformer, tokenizer, rule checker, chord extractor, PPO loop,
-constrained decoder, chord-interleaved training loop, and A/B study are
-implemented from scratch in this repo. No pretrained checkpoints were used.
+constrained decoder, chord-interleaved training loop, metric-weighted mask,
+beat-aware HOLD prior, cross-voice articulation coupling, REST-suppressing
+logit shaper, listening-side note merger, and A/B study are implemented from
+scratch in this repo. No pretrained checkpoints were used.
