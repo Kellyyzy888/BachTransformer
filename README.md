@@ -4,18 +4,22 @@ A from-scratch PyTorch decoder-only Transformer (~4.8M params) for four-part
 (SATB) Bach chorale generation, with music-theory rule injection at three
 different points in the pipeline.
 
-CSCI 1470 capstone project, Brown University. See [`../writeup.md`](../writeup.md)
+CSCI 1470 final project, Brown University. See [`../writeup.md`](../writeup.md)
 for the full paper; this README covers how to run the code.
 
 ## Headline result
 
 **M4 + M3 (chord-conditioned SFT + rule-masked decoding) reduces mean
-HarmonicScore by 47% vs. the vanilla Transformer baseline** on JSB Chorales
-(4.20 → 2.24, n=50 generated pieces). Parallel octaves drop from 57 to 1.
+HarmonicScore by 64.5% vs. the vanilla Transformer baseline** on JSB Chorales
+(3.80 → 1.35, n=20 generated pieces). Parallel octaves drop from 1.4 per piece
+to 0.0; voice crossings and hidden octaves likewise vanish.
 
-Chord conditioning alone (M4) does not help; rule-masked decoding alone (M3)
-helps; the combination is where the win comes from. See the writeup for the
-ablation story.
+All three interventions help individually — chord conditioning alone (M4) cuts
+HS by 14%, decode-time rule masking alone (M3) by 57%, PPO fine-tuning (M2) by
+17% — but combining chord conditioning with rule-masked decoding is where the
+biggest win comes from. See the writeup for the ablation story and how the
+M4 architecture (8 layers, `d_ff=1536`, learned chord-attention bias) compares
+to the M1 baseline architecture.
 
 We then extended the same decode-time-constraint philosophy from harmony to
 **rhythm and texture** (M5): a metric-weighted rule mask, a beat-aware HOLD
@@ -28,12 +32,17 @@ section below for how to run it.
 
 | ID | What changes | Where the rules live | Result vs M1 |
 |----|--------------|----------------------|--------------|
-| **M1** | Baseline SFT, no rule info | nowhere | — |
-| M2 | PPO fine-tune with `−HarmonicScore` reward | training (RL) | +10% (worse) |
-| M3 | M1 + logit masking at decode | sampling | 1.35 HS (much better, earlier eval) |
-| **M4** | Chord-conditioned SFT (TonicNet-style, interleaved Roman numerals, all-12-key transpose) | training (data) | +8% (worse) |
-| **M4 + M3** | M4 model with M3 rule-mask at decode | both | **−47% (best HS)** |
-| M4 + M5 | M4 model with meter-aware decode stack (metric mask + HOLD prior + voice coupling + REST penalty) | sampling (rhythm + texture) | −43% HS, attacks/bar 16 → 3 (Bach-like texture) |
+| **M1** | Baseline SFT, no rule info | nowhere | — (HS 3.80) |
+| M2 | PPO fine-tune with `−HarmonicScore` reward | training (RL) | −17% (3.15) |
+| M3 | M1 + logit masking at decode | sampling | −57% (1.65) |
+| **M4** | Chord-conditioned SFT (TonicNet-style, interleaved Roman numerals, all-12-key transpose, 8 layers + chord-attn bias) | training (data + arch) | −14% (3.25) |
+| **M4 + M3** | M4 model with M3 rule-mask at decode | both | **−64.5% (1.35, best HS)** |
+| M4 + M5 | M4 model with meter-aware decode stack (metric mask + HOLD prior + voice coupling + REST penalty) | sampling (rhythm + texture) | −20% HS (3.05), attacks/bar 16 → 3 (Bach-like texture) |
+
+> Numbers above are from `eval/RETRAINED_RESULTS.md` (n=20). An earlier
+> eval pass (n=50, with a smaller M4 architecture and an unmodified PPO
+> loop) produced different numbers — see the writeup's Reflection section
+> for that history.
 
 ## Layout
 
@@ -109,17 +118,17 @@ python -m eval.run_eval --samples_dir samples/m4_m3 --compare_to samples/m1
 
 ```bash
 # From our laptops: push files
-scp -r . 'zyang188@ssh.ccv.brown.edu:~/bach_transformer/'
+scp -r . 'username@ssh.ccv.brown.edu:~/bach_transformer/'
 
 # From OSCAR login node: submit a training job
-ssh zyang188@ssh.ccv.brown.edu
+ssh username@ssh.ccv.brown.edu
 cd ~/bach_transformer
 sbatch -J bach_m1                                 scripts/oscar_train.sh
 sbatch -J bach_m2   --export=ALL,STAGE=m2         scripts/oscar_train.sh
 sbatch -J bach_m4   --export=ALL,STAGE=m4         scripts/oscar_train.sh
 
 # Monitor
-squeue -u zyang188
+squeue -u username
 tail -f logs/bach_m4_<jobid>.out
 ```
 

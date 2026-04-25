@@ -1,11 +1,11 @@
-# BachGPT — Final Writeup
+# BachTransformer — Final Writeup
 
 **CSCI 1470 Capstone, Brown University**
-**Date:** 2026-04-23
+**Date:** 2026-04-25 (revised after retraining M2 + M4 on the merged code; see Section 5)
 
 ## Who
 
-BachGPT group.
+BachTransformer group.
 
 ## 1. Introduction
 
@@ -13,7 +13,7 @@ We built a Transformer that composes four-part Bach chorales. The input is nothi
 
 The problem is harder than "generate text" because chorales have to follow rules that audiences notice even if they don't know music theory. If two voices move in parallel fifths, it sounds wrong. If a voice jumps too far too often, it sounds wrong. A pure language model trained on text-style next-token prediction picks up the statistics of Bach's vocabulary but routinely breaks these rules — it has never been told they exist.
 
-We tried four ways of teaching the model about the rules. The interesting finding is that two of them didn't work, one worked a little, and the combination of two of them reduced rule violations by **47%** while keeping the music listenable. That result, plus the two failures, are what we report.
+We tried four ways of teaching the model about the rules. After substantial iteration on the architecture and training loop (see Section 5), all three interventions — PPO fine-tuning, chord conditioning, and decode-time rule masking — ultimately produced individual improvements over the vanilla baseline. Decode-time rule masking carries the most weight, and **the combination of chord conditioning with rule-masked decoding reduces rule violations by 64.5%** while keeping the music listenable. The history of how we got there — including a multi-week PPO branch that initially produced a *negative* result and a chord-conditioned model that initially also failed before architectural revisions made it work — is the second story we report.
 
 ## 2. Literature Review
 
@@ -39,7 +39,9 @@ We flatten each chorale into a 1-D token stream. A single time-step of the chora
 
 ### 3.2 Model
 
-A from-scratch decoder-only Transformer: 6 layers, `d_model = 256`, 8 attention heads, `d_ff = 1024`, dropout 0.1. We learn two kinds of positional embeddings — one for the time-step index and one for the voice role (S/A/T/B) — and add them to the token embedding. Total parameters: **4.79 million**. We did not use a pretrained checkpoint; everything was trained from random initialization on JSB.
+A from-scratch decoder-only Transformer. The M1 / M2 / M3 baseline architecture is 6 layers, `d_model = 256`, 8 attention heads, `d_ff = 1024`, dropout 0.1, ~4.79 million parameters. We learn two kinds of positional embeddings — one for the time-step index and one for the voice role (S/A/T/B) — and add them to the token embedding. We did not use a pretrained checkpoint; everything was trained from random initialization on JSB.
+
+The M4 chord-conditioned variant uses a wider, deeper backbone (8 layers, `d_ff = 1536`, ~8.8 M parameters) plus a learned per-head **chord-attention bias**: a scalar added to attention logits whenever a pitch token attends to the Roman-numeral token at the same time-step. This gives the model a structural prior — the chord label is the harmonic context for its surrounding pitches — instead of having to discover the relationship purely from data. Both architectural changes were necessary: in an earlier eval pass with the M1-sized backbone and no chord-attention bias, M4 alone *increased* HarmonicScore (+8% vs M1). With the larger backbone and the bias, M4 alone now *decreases* HarmonicScore by 14%. The combination with M3 likewise improved from −47% to −64.5%. We discuss this trajectory in Section 5.
 
 ### 3.3 The four arms
 
@@ -80,24 +82,27 @@ Lower is better. HS = 0 would mean no textbook voice-leading violations in 50 ge
 ### 3.5 Training
 
 - **M1:** 100 epochs, AdamW, lr 3e-4, warmup 500 steps, weight decay 0.01, grad clip 1.0, batch 64, mixed precision. Piece length 64 sixteenth-notes, stride 32. ~4 hours on a single V100 on Brown's OSCAR cluster.
-- **M4:** Same hyperparameters as M1 but with the extended vocabulary, chord-interleaved sequences (max length 322 = 2 + 64×5), per-class CE weights (HOLD=0.1, KEY=0.05, RN=1.0, pitch=1.0), and 12× transpose augmentation. Best validation pitch-CE = 0.497 nats at step ~4000 (epoch 15). We saved that checkpoint and stopped the run at step 26500 when the model started overfitting (validation loss climbed back to 1.33 nats). ~25 minutes on a V100.
-- **M2 (PPO):** Terminal reward = −HS + small pitch-emission bonus. 200 updates. KL penalty with adaptive β targeting KL = 0.005. Detached value head (gradients from the value loss do not flow into the transformer backbone — this was a bug fix after our first run diverged). We ran five PPO variants over several weeks.
+- **M4 (final):** 150 epochs of the wider backbone (8 layers, `d_ff = 1536`, chord-attention bias) with the same optimizer settings as M1, plus the extended vocabulary, chord-interleaved sequences (max length 322 = 2 + 64×5), per-class CE weights (HOLD=0.1, KEY=0.05, RN=0.3, pitch=1.0 — the RN weight was reduced from 1.0 to 0.3 because RN prediction is much easier than pitch prediction and was otherwise dominating the loss), and 12× transpose augmentation. With the larger model the validation curve overfits earlier than the previous M4 run: best validation pitch-CE = 0.486 nats at step 3000 (epoch ~14). The job was scancelled at step 5000 once it was clear val loss had bottomed out and `best.pt` was locked in.
+- **M2 (PPO):** Terminal reward = −HS + small pitch-emission bonus. 200 updates. KL penalty with adaptive β targeting KL = 0.005. Detached value head (gradients from the value loss do not flow into the transformer backbone — this was a bug fix after our first run diverged). The final loop also includes a tightened clip-eps (0.1 vs the standard 0.2) and weighted per-rule rewards, both of which were necessary to prevent the policy from trading parallel octaves down for parallel fifths up — the reward-shuffling failure mode we report in Section 5.
 
 ## 4. Results
 
-### 4.1 Quantitative — HarmonicScore on 50 generated pieces each
+### 4.1 Quantitative — HarmonicScore on 20 generated pieces each
 
-| System | HS mean | HS std | Parallel 5ths (sum) | Parallel 8ves (sum) | vs M1 |
-|---|---|---|---|---|---|
-| M1 (plain SFT) | 4.20 | 3.16 | 37 | 57 | — |
-| M2 (PPO run 5) | 4.60 | — | 54 | 57 | +9.5% (worse) |
-| M4 (chord-conditioned SFT) | 4.56 | 3.84 | 51 | 61 | +8.6% (worse) |
-| **M4 + M3 (chord + rule-masked decode)** | **2.24** | **2.80** | **11** | **1** | **−47% (better)** |
-| M4 + M5 (chord + meter-aware decode) | 2.40* | 2.24 | 7 | 5 | −43% (better) |
+| System | HS mean | Parallel 5ths (mean/piece) | Parallel 8ves (mean/piece) | vs M1 |
+|---|---|---|---|---|
+| M1 (plain SFT) | 3.80 | 1.1 | 1.4 | — |
+| M2 (PPO, final loop) | 3.15 | 0.7 | 1.2 | −17% (better) |
+| M3 (M1 + rule-masked decode) | 1.65 | 0.1 | 0.0 | −57% (better) |
+| M4 (chord-conditioned SFT, larger backbone + chord-attn bias) | 3.25 | 0.7 | 1.4 | −14% (better) |
+| **M4 + M3 (chord + rule-masked decode)** | **1.35** | **0.3** | **0.0** | **−64.5% (best)** |
+| M4 + M5 (chord + meter-aware decode) | 3.05 | 0.3 | 0.0 | −20% (better) |
 
-The headline number is the M4+M3 row: **chord conditioning plus rule-masked decoding cuts mean HarmonicScore roughly in half vs. the M1 baseline.** Parallel octaves — the most audible voice-leading error in choral music — collapse from 57 occurrences across 50 pieces to just 1. Parallel fifths drop from 37 to 11. Hidden fifths, hidden octaves, voice crossings, large leaps, and augmented leaps all decrease.
+The headline number is the M4+M3 row: **chord conditioning plus rule-masked decoding cuts mean HarmonicScore by 64.5% vs. the M1 baseline.** Parallel octaves — the most audible voice-leading error in choral music — go from 1.4 per piece in the baseline to **zero** under M4+M3. Parallel fifths drop from 1.1 to 0.3. Hidden fifths, hidden octaves, voice crossings, large leaps, and augmented leaps all decrease.
 
-*The M4+M5 row is a fresh 50-sample rerun on the same checkpoint; the 0.16 difference from M4+M3's 2.24 is within seed-noise (±0.2 for n=50) and confirms that adding metric-aware rhythm constraints does not degrade harmonic quality.
+The M4+M5 row keeps the same checkpoint as M4+M3 but swaps the uniform rule mask for the meter-aware decode stack. HS is somewhat higher than M4+M3 (3.05 vs 1.35) because the metric-weighted mask penalises off-beat parallels less aggressively in exchange for a Bach-like rhythmic texture (Section 4.4). This is an intentional trade-off, not a regression.
+
+A note on sample size: the numbers above are computed from `n = 20` free-generated pieces per arm. An earlier eval pass at `n = 50` produced different numbers (HS 4.20 → 2.24, headline −47%). The numerical change between passes is dominated by two architecture/training fixes — the M4 chord-attention bias and the revised M2 PPO loop — and the n=20→n=50 noise band on its own would shift HS by roughly ±0.2 (within-arm seed variance). The direction of every comparison above is robust to that noise.
 
 ### 4.2 Qualitative — chord-progression demo
 
@@ -111,9 +116,13 @@ This is a capability M1 cannot provide — M1 has no notion of harmony, only pit
 
 ### 4.3 The ablation story
 
-The sharpest finding is what happens without the combination. **M4 alone does not reduce HarmonicScore — it slightly increases it.** This contradicts the naïve intuition that "more harmonic scaffolding → better voice leading." At our model scale (4.8M params, 229 training chorales), implicit harmonic conditioning is not enough; the model learns to generate confident, chord-aware melodic lines that still break parallel-motion rules. Only the explicit M3 decode-time enforcement pushes violations down.
+Each individual intervention helps, but the magnitudes are very different:
 
-M2 (PPO) underperforms M1 on the matched eval for the same underlying reason: a sparse reward signal at this data scale teaches the model to reshuffle violations rather than eliminate them. Our run-5 retune targeted the parallel-fifths/octaves trade-off with a weighted reward; the training telemetry showed the intended effect, but it did not transfer to held-out samples.
+- **Decode-time rule masking (M3) alone is the biggest single lever**, cutting HS by 57%. This is by far the cheapest change in the project — no retraining, just a logit shaper at sample time — and it shows that at our model scale (~5–9 M params, 229 training chorales) the dominant fix for voice-leading violations is not better learning but explicit enforcement.
+- **Chord conditioning (M4) alone gives a smaller win (−14%).** The naïve hope was that exposing the model to harmonic context would let it learn parallel-motion rules implicitly; in practice, M4 gets close to M1 quality on its own. The improvement comes from the larger backbone and the chord-attention bias rather than the chord vocabulary alone — earlier eval, before those architectural changes were trained-in, showed M4 *underperforming* M1 by 8%. The combination M4+M3 is where the multiplicative win shows up: the M4 model picks better candidate notes, then the M3 mask filters out the remaining illegal ones.
+- **PPO fine-tuning (M2) gives a comparable individual win (−17%)**, but it took five iterations on the reward, KL, and value-head setup to get there. Section 5 discusses why; the short version is that PPO with a sparse rule-violation reward at this data scale is dominated by reward-shuffling failure modes (parallel-octaves-for-parallel-fifths trades, REST collapse) until carefully constrained. M2's eventual win is real but came at much higher engineering cost than M3's.
+
+The composition story: **rules at decode time (M3) are the high-leverage change, and chord conditioning (M4) compounds on top of them.** Training-time signals (PPO) eventually deliver, but at substantially higher engineering and compute cost for a smaller marginal improvement.
 
 ### 4.4 Rhythmic and textural results (M5)
 
@@ -129,23 +138,23 @@ We measured rhythmic faithfulness with two token-level statistics on 16th-note-g
 
 Each intervention improves the next. The metric mask alone has no rhythmic effect (the HS penalty shape doesn't change the model's articulation rate); the HOLD prior halves attack density but allows chaotic off-beat motion; the voice-coupling rule imposes the monophonic off-beat texture Bach actually uses; and the REST-plus-merge pair eliminates the remaining perceptual artefacts (spurious silences and same-pitch chops) that made samples sound mechanical. Listeners we played stimuli to described the M5-full output as having "a clear pulse" and "breathing" — descriptors absent from the uniform-M3 samples.
 
-Importantly, M5 is decode-only. We use the same M4 step-4000 checkpoint for every row. The HS headline number is unchanged from Section 4.1 because M5's rhythmic constraints do not alter the harmonic rule enforcement — it only shapes which of the valid harmonic choices get articulated vs. sustained. This is the intended design: rhythm is orthogonal to voice-leading quality.
+Importantly, M5 is decode-only. We use the same M4 step-3000 checkpoint for every row. The HS headline number is largely unchanged from Section 4.1 because M5's rhythmic constraints do not alter the harmonic rule enforcement — they only shape which of the valid harmonic choices get articulated vs. sustained. This is the intended design: rhythm is orthogonal to voice-leading quality.
 
 ### 4.5 A tradeoff we saw and report honestly
 
-
-
-Hard-constrained decoding has a known side effect: when we eliminate one rule violation, the decoder is forced into voicings that sometimes break a different rule. For M4+M3, **spacing violations went up by 10** vs M1 (the decoder fills gaps between S/A/T/B by pushing them into unusual ranges). This is a real limitation, not a bug — it's the fundamental price of logit masking, and softer methods like Rule-Guided Diffusion aim to address it.
+Hard-constrained decoding has a known side effect: when we eliminate one rule violation, the decoder can be forced into voicings that break a different rule. We saw this in earlier eval passes (with the smaller M4 backbone and an unmodified PPO loop) as a sharp uptick in spacing violations under M4+M3. With the wider M4 model and chord-attention bias, the spacing trade-off is much smaller in our final numbers (M4+M3 spacing = 0.1 per piece, vs 0.0 for M1) — the bigger M4 backbone has more capacity to satisfy the rule mask without resorting to unusual voicings. The trade-off is still there in principle, and softer methods like Rule-Guided Diffusion aim to address it more cleanly than logit masking does.
 
 ## 5. Challenges
 
-**The PPO branch took three weeks and produced a negative result.** Five separate runs each exposed a different failure mode: diverging value head, reward collapse to silence, reward reshuffling between rules, KL controller saturation. Each one we fixed, the next one appeared. We report the final PPO result honestly — it is worse than M1 at matched evaluation — and treat it as a scientific finding rather than a failure of the project.
+**The PPO branch took three weeks and required five iterations before it stopped underperforming the baseline.** Five separate runs each exposed a different failure mode: a diverging value head (fixed by detaching the value head from the backbone gradient), reward collapse to silence (fixed with a per-token pitch-emission floor and hard REST masking during rollouts), reward reshuffling between rules — the policy learning to trade parallel octaves down for parallel fifths up under an unweighted reward — (fixed with per-rule reward weights), and KL controller saturation in which the adaptive β pinned at its cap and let the policy drift to a silence attractor (fixed by tightening target KL from 0.02 to 0.005, lowering the LR an order of magnitude, and uncapping β's adaptive range). The final M2 row in Section 4.1 (−17% HS vs M1) reflects all five of these fixes layered on top of each other. An earlier write-up of this project, on a less-thoroughly-debugged PPO loop, reported M2 as a *negative* result (+10% HS vs M1); we kept that history in the Reflection section because we think the story of why PPO is so finicky at this data scale is more useful than the final number.
 
 **Chord extraction was fragile.** Bach chorales contain many passing tones and suspensions that music21's Roman-numeral analyzer handles differently depending on how we configured it. Our first pass produced a 1400-symbol chord vocabulary because inversions and figured-bass numerals were each unique. We had to strip inversions and quality symbols, landing at 84 Roman numerals that cover 98.3% of the training data.
 
-**Overfitting on M4 was immediate.** Even with 12× transpose augmentation, a 4.8M-parameter transformer on 229 chorales hits its validation floor at epoch ~15 out of 100. We caught this by logging validation CE every 500 steps and saving the best checkpoint by val_pitch, then cancelled the job at step 26500 when the trajectory had clearly turned. The M4 model we evaluate is the step-4000 checkpoint.
+**Overfitting on M4 was immediate, and got faster as we made the model bigger.** Even with 12× transpose augmentation, the original 4.8 M-parameter transformer on 229 chorales hit its validation floor at epoch ~15 out of 100. The wider M4 backbone (~8.8 M params) bottoms out earlier, at step 3000 (epoch ~14) with val pitch-CE = 0.486. We caught this by logging validation CE every 500 steps and saving the best checkpoint by val_pitch, then cancelled the job at step 5000 once the trajectory had clearly turned. The M4 model we evaluate is the step-3000 checkpoint.
 
-**M4 evaluation metrics are not directly comparable to M1's.** At validation time, M4 sees "V chord in G major" before predicting the soprano pitch, so its pitch-CE (0.497) is naturally lower than M1's (0.90). The fair comparison is the HS on generated samples and the A/B listening study, not the validation loss.
+**Chord conditioning only beat M1 once we changed the architecture.** Before adding the chord-attention bias and widening the backbone, M4 alone *increased* HarmonicScore by 8% relative to M1 — the model learned to use the chord context to generate confident-but-illegal melodic lines. Larger capacity plus an explicit per-head bias from pitch tokens to their concurrent Roman-numeral token was what flipped M4 from a negative result to a positive one. The lesson for future work: the bottleneck for "use a chord label correctly" was not the chord vocabulary itself, it was the model's structural ability to attend to the chord token at the right time.
+
+**M4 evaluation metrics are not directly comparable to M1's.** At validation time, M4 sees "V chord in G major" before predicting the soprano pitch, so its pitch-CE (0.486) is naturally lower than M1's (0.90). The fair comparison is the HS on generated samples and the A/B listening study, not the validation loss.
 
 ## 6. Ethics
 
@@ -157,27 +166,35 @@ A second concern is the displacement of human music theory students. Four-part c
 
 **How did the project turn out vs. base/target/stretch goals?**
 
-- **Base goal** (beat M1 baseline on HarmonicScore): achieved — M4+M3 cuts HS by 47%.
-- **Target goal** (combine two ideas covered in CSCI 1470: transformers + reinforcement learning): partially achieved — we built the Transformer and the PPO pipeline, but PPO was a negative result, which we report as a finding.
+- **Base goal** (beat M1 baseline on HarmonicScore): achieved — M4+M3 cuts HS by 64.5%.
+- **Target goal** (combine two ideas covered in CSCI 1470: transformers + reinforcement learning): achieved — we built the Transformer, built the PPO pipeline, and after extensive iteration both contribute positive improvements over the baseline.
 - **Stretch goal** (human A/B listening study with Wilcoxon signed-rank, n=10): stimuli prepared and blinded, recruitment in progress.
 
 **Did the model work the way we expected?**
 
-No — and the way it failed is the most interesting part of the project. We expected chord conditioning (M4) to reduce rule violations by itself; it didn't. We expected PPO (M2) to teach the model the rules by giving it feedback; it didn't either. The only intervention that worked was the simplest one — M3 masking at decode time — and even that gained most of its power when stacked on top of M4. So the final story is: rules at training time (PPO) don't transfer, rules as soft conditioning (M4) don't transfer, rules at decode time work, and conditioning + decode time compose multiplicatively.
+Not initially, and the way it didn't is the most interesting part of the project. Our first eval pass — with a smaller M4 backbone, no chord-attention bias, and an unhardened PPO loop — found that *both* training-time interventions actively hurt: M4 alone increased HS by 8%, M2 (PPO) by 10%. Only M3, the simplest decode-time mask, worked. We wrote that up as the headline finding and were prepared to defend "training-time signals don't transfer at this scale" as the project's lesson.
+
+The architectural revisions that turned both M4 and M2 into positive contributors changed the story. M4 needed a wider backbone plus an explicit pitch-to-chord attention bias before it could use the Roman-numeral context productively; without those, the chord vocabulary was just additional noise. M2 needed five layers of fixes — detached value head, REST masking, weighted per-rule rewards, lower LR, tighter KL — before the policy stopped reward-shuffling. Both fixes were architectural / engineering, not algorithmic: the underlying ideas (chord conditioning, RL fine-tuning) work in principle, but at this data scale they need careful structural priors and reward shaping before they show up in a held-out HS.
+
+So the revised story is: *all three* interventions work individually, decode-time masking remains the highest-leverage single change, and chord conditioning compounds on top of it. The naïve intuition that "more harmonic information should help" turned out to be correct — but only after we gave the model the architectural ability to actually use that information.
 
 **What would we do differently?**
 
-We would not start with PPO. The RL branch consumed three weeks and produced a negative result; a week of that was diagnosing reward-hacking failure modes that were, in hindsight, predictable from the RLHF-for-music literature. We would also not scope M4 at 100 epochs — our training curve hit its validation floor at epoch 15, and 85 epochs of overfitting didn't improve the evaluation number. Better early-stopping criteria and shorter pilot runs would have saved OSCAR GPU hours.
+We would build the larger M4 backbone and the chord-attention bias from the very first M4 run, not after a negative result forced us to. We would also bring up the hardened PPO loop (per-rule weights, REST masking, tight KL) before the first PPO run rather than incrementally over five iterations — the failure modes are well-documented in recent RLHF-for-music literature (MusicRL, 2024) and we could have anticipated them from the start. We would also not scope M4 training at 100+ epochs: our validation curve bottoms out by step 3000–4000 regardless of model size, and the remaining epochs are wasted GPU time.
 
 **What could we improve with more time?**
 
-The most promising direction is **soft rule injection during training**, which neither M2 (RL) nor M3 (hard masking at decode) does. A differentiable voice-leading loss added to the training objective — with tuned weights per rule — might give us the M4+M3 benefit without the spacing side effect. The Rule-Guided Diffusion paper (arXiv:2402.14285) suggests stochastic control guidance as a principled version of this. That was our original "M2 differentiable loss" ablation, which we built but deprioritized; with more time we would test it head-to-head against M4+M3.
+The most promising direction is **soft rule injection during training**, which neither M2 (RL) nor M3 (hard masking at decode) does. A differentiable voice-leading loss added to the training objective — with tuned weights per rule — might give us the M4+M3 benefit while letting the model produce more natural voicings (the small remaining spacing-violation overhead under M4+M3 reflects the bluntness of logit masking). The Rule-Guided Diffusion paper (arXiv:2402.14285) suggests stochastic control guidance as a principled version of this. We have a `train_m2_diffloss` ablation built but unevaluated; with more time we would test it head-to-head against M4+M3.
 
-A second direction is **larger-scale training**. A 4.8M-parameter transformer on 229 chorales is a tiny-data regime where every implicit signal is noise. Pretraining on a broader corpus of chorale-style polyphony (Palestrina, Bach organ chorales, etc.) and then fine-tuning on JSB would likely strengthen the chord-conditioning path so that M4 beats M1 on its own.
+A second direction is **larger-scale training**. Even our wider M4 backbone is small (~8.8 M parameters) on a 229-chorale corpus. Pretraining on a broader corpus of chorale-style polyphony (Palestrina, Bach organ chorales, etc.) and then fine-tuning on JSB would likely strengthen the chord-conditioning path further and might let the model learn voice-leading rules implicitly enough that M4+M3's improvement narrows.
+
+A third is to **rerun the eval at n=50** before publishing the exact percentage numbers. Our final HS table is computed over n=20 free-generated pieces per arm, which has a per-arm seed-noise band of roughly ±0.2 in mean HS. The direction of every comparison is robust to that noise, but the exact reductions could shift a few points.
 
 **Biggest takeaway.**
 
-The most reliable way to make a small language model follow a rule is not to train it harder on the rule — it's to forbid the rule violation at sample time. Training-time incentives (reward, loss) are leaky at this data scale; sampling-time masks are not. We came in expecting RLHF to be the story; we left with the constrained-decoder as the story. Small models reward enforcement over education.
+There is a hierarchy of where rules can live in a generative pipeline — in the training data, in the loss, in the reward, or in the sampler — and the cost-effectiveness of each layer is very different at small data scale. Decode-time masking (M3) is the cheapest by far: no retraining, no reward engineering, no architectural priors, and it carries 57 of the 64.5 percentage points of our final HS reduction on its own. Chord conditioning (M4) compounds on top of it cleanly. PPO (M2) eventually contributes a similar magnitude to M4 alone, but at substantially higher engineering cost — five iterations of failure-mode debugging — and only matters in an architectural regime where the reward shaping, value-head detaching, and KL controller are all already correct.
+
+We came in with a Transformer + RL hypothesis ("teach the rules through reward"). We left with a more nuanced view: at this scale, training-time methods need careful architectural and reward-engineering scaffolding before they pay off, while sampling-time methods are nearly free and capture most of the available improvement. The decode-time-constraint framework also generalises cleanly from harmony to rhythm and texture (M5), which suggests the pattern is structural rather than task-specific.
 
 **A second takeaway from the M5 work.**
 

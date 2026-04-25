@@ -5,8 +5,14 @@ checkpoints/
 
 # generated samples — regenerable
 samples/
+samples_eval/
 *.mid
 *.midi
+# …but DO commit the curated listening study stimuli (small, intended for
+# poster + listening study link). Recursive whitelist: nested per-arm dirs.
+!listening_samples/
+!listening_samples/**/*.mid
+!listening_samples/**/*.midi
 
 # dataset + caches — regenerable or redistributable separately
 JSB-Chorales-dataset/
@@ -29,3 +35,10 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+
+# local-only retrain / regen helpers — kept out of the repo by request.
+# The two committed scripts (oscar_train.sh, setup_oscar.sh) are explicit
+# whitelisted exceptions.
+scripts/*
+!scripts/oscar_train.sh
+!scripts/setup_oscar.sh
