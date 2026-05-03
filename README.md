@@ -1,91 +1,4 @@
-# Bach Transformer
-
-A from-scratch PyTorch decoder-only Transformer (~4.8M params) for four-part
-(SATB) Bach chorale generation, with music-theory rule injection at three
-different points in the pipeline.
-
-CSCI 1470 final project, Brown University. See [`../writeup.md`](../writeup.md)
-for the full paper; this README covers how to run the code.
-
-## Headline result
-
-**M4 + M3 (chord-conditioned SFT + rule-masked decoding) reduces mean
-HarmonicScore by 64.5% vs. the vanilla Transformer baseline** on JSB Chorales
-(3.80 → 1.35, n=20 generated pieces). Parallel octaves drop from 1.4 per piece
-to 0.0; voice crossings and hidden octaves likewise vanish.
-
-All three interventions help individually — chord conditioning alone (M4) cuts
-HS by 14%, decode-time rule masking alone (M3) by 57%, PPO fine-tuning (M2) by
-17% — but combining chord conditioning with rule-masked decoding is where the
-biggest win comes from. See the writeup for the ablation story and how the
-M4 architecture (8 layers, `d_ff=1536`, learned chord-attention bias) compares
-to the M1 baseline architecture.
-
-We then extended the same decode-time-constraint philosophy from harmony to
-**rhythm and texture** (M5): a metric-weighted rule mask, a beat-aware HOLD
-prior, cross-voice articulation coupling, and REST suppression together cut
-the per-voice attack density from 16 per bar down to about 3 — Bach territory
-— without touching the model or the HS score. See the "Meter-aware decoding"
-section below for how to run it.
-
-## Experimental arms
-
-| ID | What changes | Where the rules live | Result vs M1 |
-|----|--------------|----------------------|--------------|
-| **M1** | Baseline SFT, no rule info | nowhere | — (HS 3.80) |
-| M2 | PPO fine-tune with `−HarmonicScore` reward | training (RL) | −17% (3.15) |
-| M3 | M1 + logit masking at decode | sampling | −57% (1.65) |
-| **M4** | Chord-conditioned SFT (TonicNet-style, interleaved Roman numerals, all-12-key transpose, 8 layers + chord-attn bias) | training (data + arch) | −14% (3.25) |
-| **M4 + M3** | M4 model with M3 rule-mask at decode | both | **−64.5% (1.35, best HS)** |
-| M4 + M5 | M4 model with meter-aware decode stack (metric mask + HOLD prior + voice coupling + REST penalty) | sampling (rhythm + texture) | −20% HS (3.05), attacks/bar 16 → 3 (Bach-like texture) |
-
-> Numbers above are from `eval/RETRAINED_RESULTS.md` (n=20). An earlier
-> eval pass (n=50, with a smaller M4 architecture and an unmodified PPO
-> loop) produced different numbers — see the writeup's Reflection section
-> for that history.
-
-## Layout
-
-```
-bach_transformer/
-  data/
-    tokenizer.py         # SATB-packed + chord-interleaved token encoder
-    jsb_loader.py        # JSB Chorales + transpose augmentation
-    chord_extractor.py   # music21 Roman-numeral analysis → chord cache
-    jsb_chords.pkl       # cached chord labels (built by chord_extractor)
-  model/
-    positional.py        # timestep + voice-role embeddings
-                         #   (supports 5-role chord layout)
-    transformer.py       # decoder-only Transformer (from scratch)
-  train/
-    train_m1.py          # M1: plain cross-entropy SFT
-    train_m2.py          # M2: PPO fine-tune from M1
-    train_m2_diffloss.py # M2 ablation: differentiable rule loss
-    train_m4.py          # M4: chord-conditioned SFT
-  sample/
-    decode_m1.py         # vanilla autoregressive sampling
-    decode_m2.py         # M2 sampling (matches PPO rollout distribution)
-    decode_m3.py         # constrained decoding (logit masking, uniform)
-    decode_m4.py         # M4 sampling (free + chord-progression-forced)
-                         #   --constrained stacks M3 rule mask
-                         #   --metric     metric-weighted parallel penalty
-                         #   --hold_prior beat-aware HOLD logit bias
-                         #   --couple     cross-voice articulation coupling
-                         #   --listen     sustained-note renderer (A/B audio)
-    metric_mask.py       # M5: metric weights, HOLD prior, voice coupling,
-                         #     REST suppression — all decode-time
-    _midi_utils.py       # shared token→MIDI conversion (rule + listen renders)
-  eval/
-    run_eval.py          # sweep generated MIDI through rule_checker.py
-    count_holds.py       # per-voice attack density and HOLD fraction diagnostics
-    ab_study.py          # human A/B listening study (prepare + analyze)
-    METRIC_ABLATION.md   # run book for the M5 ablation rows
-  literature/
-    related_work.md      # SOTA positioning, BibTeX
-  configs/base.yaml      # all hyperparameters
-  scripts/oscar_train.sh # OSCAR/SLURM launcher (STAGE=m1|m2|m4)
-  PLAN_M4.md             # design doc for M4
-```
+This project is developed as CSCI 1470 final project at Brown University. In this project, we study four-part Bach chorale generation as an autoregressive sequence modeling problem with explicit music-theory rule injection. Our goal is to test whether symbolic rule knowledge will improve the generation quality and where symbolic rule knowledge is most effective.
 
 ## Quick start (local CPU)
 
@@ -202,14 +115,6 @@ After listeners complete `listener_form.csv`:
 ```bash
 python -m eval.ab_study analyze --responses study/responses.csv
 ```
-
-Reports Wilcoxon signed-rank statistics on listener-level mean preferences.
-
-## Citation
-
-If others build on this work, we ask that they cite our writeup and the
-TonicNet paper (Peracha 2019, arXiv:1911.11775) that inspired our M4
-chord-conditioning layout.
 
 ## Open-source components
 
